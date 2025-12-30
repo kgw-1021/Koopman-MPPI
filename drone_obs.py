@@ -6,7 +6,10 @@ from functools import partial
 from mpl_toolkits.mplot3d import Axes3D
 from optimize import BatchedADMM
 import time
-
+import os
+import shutil   
+import io
+import imageio.v2 as imageio
 
 # =========================================================
 # 1. Constants & B-Spline
@@ -259,10 +262,56 @@ class KoopmanMPPI:
         
         return dist_err + final_err + obs_pen + vel_running + vel_running + vel_terminal 
 
+def plot_profiles(history_dict, dt):
+    """
+    RPY, Thrust, Torques 프로파일링 시각화 함수
+    """
+    rpy = np.array(history_dict['rpy'])
+    u = np.array(history_dict['u'])
+    
+    # 시간 축 생성
+    time_steps = np.arange(len(rpy)) * dt
+    
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    
+    # 1. Attitude (RPY)
+    axes[0].plot(time_steps, rpy[:, 0], label='Roll (phi)', color='r')
+    axes[0].plot(time_steps, rpy[:, 1], label='Pitch (theta)', color='g')
+    axes[0].plot(time_steps, rpy[:, 2], label='Yaw (psi)', color='b')
+    axes[0].set_ylabel('Angle [rad]')
+    axes[0].set_title('Drone Attitude (Roll, Pitch, Yaw)')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True)
+    
+    # 2. Control Input: Thrust
+    axes[1].plot(time_steps, u[:, 0], label='Thrust', color='k')
+    # Saturation Line (Max Thrust)
+    axes[1].axhline(y=20.0, color='r', linestyle='--', alpha=0.5, label='Max Thrust')
+    axes[1].set_ylabel('Thrust [N]')
+    axes[1].set_title('Control Input: Thrust')
+    axes[1].legend(loc='upper right')
+    axes[1].grid(True)
+    
+    # 3. Control Input: Torques
+    axes[2].plot(time_steps, u[:, 1], label='Torque X', color='r', linestyle='--')
+    axes[2].plot(time_steps, u[:, 2], label='Torque Y', color='g', linestyle='--')
+    axes[2].plot(time_steps, u[:, 3], label='Torque Z', color='b', linestyle='--')
+    # Saturation Line (Max Torque)
+    axes[2].axhline(y=1.0, color='gray', linestyle=':', alpha=0.5)
+    axes[2].axhline(y=-1.0, color='gray', linestyle=':', alpha=0.5)
+    axes[2].set_ylabel('Torque [Nm]')
+    axes[2].set_xlabel('Time [s]')
+    axes[2].set_title('Control Input: Torques')
+    axes[2].legend(loc='upper right')
+    axes[2].grid(True)
+    
+    plt.tight_layout()
+    plt.show()
+
 # =========================================================
 # 5. Main Simulation
 # =========================================================
-def run_simulation():
+def run_simulation(save_gif=True, gif_filename="drone_obstacle.gif"):
     # Params
     DT = 0.01      
     H = 40         
@@ -289,7 +338,11 @@ def run_simulation():
     ax = fig.add_subplot(111, projection='3d')
     traj_hist = [z_curr[:3]]
     
-    print("Starting Dense Koopman MPPI (Fixed ADMM Interface)...")
+    frames = []
+    profile_data = {'rpy': [], 'u': []}
+
+
+    print("Simulation Running...")
     
     for t in range(500):
         key, subkey = jax.random.split(key)
@@ -307,8 +360,10 @@ def run_simulation():
         z_curr = se3_step(z_curr, u_applied, DT)
         traj_hist.append(z_curr[:3])
         
+        profile_data['rpy'].append(z_curr[6:9])
+        profile_data['u'].append(u_applied)
+
         dist = jnp.linalg.norm(z_curr[:3] - target)
-        print(f"Step {t:02d} | Dist: {dist:.2f} | FPS: {1.0/dt_step:.1f}")
         
         if t % 1 == 0:
             ax.cla()
@@ -334,13 +389,27 @@ def run_simulation():
             ax.scatter(target[0], target[1], target[2], marker='*', s=200, color='gold')
             
             ax.set_xlim(-1, 4); ax.set_ylim(-1, 4); ax.set_zlim(0, 4)
-            plt.pause(0.01)
+
+            if save_gif:
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', dpi=180)
+                buf.seek(0)
+                frames.append(imageio.imread(buf))
+                buf.close()
+            else:
+                plt.pause(0.01)
             
         if dist < 0.2:
             print("Target Reached!")
             break
 
-    plt.show()
+    if save_gif and len(frames) > 0:
+        imageio.mimsave(gif_filename, frames, fps=8, loop=0)
+        print("Done!")
+    else: 
+        plt.show()
+
+    plot_profiles(profile_data, DT)
 
 if __name__ == "__main__":
-    run_simulation()
+    run_simulation(save_gif=False, gif_filename="drone_obstacle.gif")

@@ -85,8 +85,6 @@ class KoopmanQPProjector:
 
     @partial(jax.jit, static_argnums=(0,))
     def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, target_pos):
-
-
         # 1. 궤적 및 자코비안 계산
         p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 6) [x,y,c,s,v,w]
         J_tensor = self.jac_fn(coeffs_noisy, z0)        # (H, 6, N_CP, 2)
@@ -269,6 +267,8 @@ def run():
     key = jax.random.PRNGKey(0)
     traj_hist = [z_curr[:2]]
     
+    log_solver_time = [] # ms
+
     print("Simulation Running...")
     
     plt.figure(figsize=(10, 6))
@@ -276,6 +276,7 @@ def run():
     for t in range(300):
         key, subkey = jax.random.split(key)
 
+        jax.block_until_ready(mean_coeffs)
         t0 = time.time()
 
         # 1. MPPI Step
@@ -285,7 +286,10 @@ def run():
         
         # Block valid for timing accurate measurements
         jax.block_until_ready(mean_coeffs)
-        dt_step = time.time() - t0
+        t_end = time.time()
+
+        solver_ms = (t_end - t0) * 1000.0
+        log_solver_time.append(solver_ms)
 
         # 2. Apply Control
         u_seq = bspline_gen.get_sequence(mean_coeffs)
@@ -297,8 +301,6 @@ def run():
         # 3. Simulate Dynamics
         z_curr = step(z_curr, u_curr, DT)
         traj_hist.append(z_curr[:2])
-        
-        print(f"Step {t:02d} | Dist: {dist_to_goal:.2f} | FPS: {1.0/dt_step:.1f}")
 
         # 4. Visualization
         if t % 1 == 0:
@@ -333,7 +335,7 @@ def run():
             vel_v = z_curr[4]
             vel_w = z_curr[5]
             plt.title(f"Step {t} | Dist: {dist_to_goal:.2f}m | Vel: {vel_v:.2f} m/s")
-            plt.axis('equal')
+            plt.gca().set_aspect('equal', adjustable='box')
             plt.xlim(-5, 10)
             plt.ylim(-4, 4)
             plt.grid(True)
@@ -345,6 +347,24 @@ def run():
             break
 
     plt.show()
+
+    plt.figure()
+    plt.plot(log_solver_time, label='Solver Time (ms)')
+    plt.title(f"ADMM solver time per step")
+    plt.xlabel("Simulation Step")
+    plt.ylabel("Time (ms)")
+    plt.legend()
+    plt.show()
+    # --- Final Stats Print ---
+    print("\n" + "="*30)
+    print(" [Simulation Result Summary]")
+    print("="*30)
+    print(f"Avg Solver Time: {np.mean(log_solver_time[3:]):.2f} ms")
+    print(f"Max Solver Time: {np.max(log_solver_time[3:]):.2f} ms")
+    print(f"Min Solver Time: {np.min(log_solver_time[3:]):.2f} ms")
+    print(f"center solver time: {np.median(log_solver_time[3:]):.2f} ms")
+    print("="*30)
+
 
 if __name__ == "__main__":
     run()

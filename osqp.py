@@ -75,68 +75,108 @@ class KoopmanQPProjector:
     @partial(jax.jit, static_argnums=(0,))
     def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, solver_init_state=None):
         # 1. 전체 궤적 및 자코비안 계산
-        p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 2)
-        J_tensor = self.jac_fn(coeffs_noisy, z0)        # (H, 2, N_CP, 2)
+        p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 6) [x, y, c, s, v, w]
+        J_tensor = self.jac_fn(coeffs_noisy, z0)        # (H, 6, N_CP, 2)
 
-        # 2. 모든 시점에 대한 장애물 거리 및 법선 벡터 계산 (Vectorized)
-        # diff: (H, 2)
-        diff = p_traj - obs_pos 
-        dist_sq = jnp.sum(diff**2, axis=1)              # (H,)
-        dist_vals = jnp.sqrt(dist_sq) + 1e-6            # (H,)
+        # ---------------------------------------------------------
+        # [추가됨] 2. Terminal State Constraint (v, w)
+        # ---------------------------------------------------------
+        # 마지막 상태의 v(4), w(5) 값 추출
+        v_final = p_traj[-1, 4]
+        w_final = p_traj[-1, 5]
+        
+        # Jacobian for v and w at terminal step
+        # J_tensor shape: (H, 6, N_CP, 2) -> [-1, 4] select -> (N_CP, 2)
+        # reshape(1, -1) -> (1, N_CP*2) : coeffs_flat과 차원 일치
+        J_v_end = J_tensor[-1, 4].reshape(1, -1)
+        J_w_end = J_tensor[-1, 5].reshape(1, -1)
+        
+        # Eq: v_final + J * delta = 0  =>  J * delta = -v_final
+        A_term = jnp.vstack([J_v_end, J_w_end])       # (2, N_var)
+        b_term = jnp.array([-v_final, -w_final])      # (2,)
+        
+        # 등식 제약이므로 l과 u를 아주 좁게 설정 (Soft Constraint 효과)
+        tol = 1e-3
+        l_term = b_term - tol
+        u_term = b_term + tol
+
+        # ---------------------------------------------------------
+        # 3. Obstacle Avoidance Constraint (기존 로직)
+        # ---------------------------------------------------------
+        diff = p_traj[:, :2] - obs_pos 
+        dist_sq = jnp.sum(diff**2, axis=1)
+        dist_vals = jnp.sqrt(dist_sq) + 1e-6
         normals = diff / dist_vals[:, None]             # (H, 2)
 
-        # 3. 전체 궤적에 대한 선형 제약조건 생성 (Batch Linearization)
-        # 식: - (Normal_t @ J_t) * delta <= - (req_dist - dist_t)
+        # J_flat: (H, 2, N_var) - 위치(0,1)에 대한 자코비안만 사용
+        J_pos = J_tensor[:, :2, :, :].reshape(self.H, 2, -1)
         
-        # J_flat: (H, 2, N_var)
-        J_flat = J_tensor.reshape(self.H, 2, -1)
-        
-        # einsum을 사용하여 모든 타임스텝의 A_obs 행을 한 번에 계산
-        # "t d, t d v -> t v" (Time, Dim, Var)
-        # 결과 A_obs_all: (H, N_var)
-        A_obs_all = -jnp.einsum('td,tdv->tv', normals, J_flat)
+        # A_obs_all: (H, N_var)
+        A_obs_all = -jnp.einsum('td,tdv->tv', normals, J_pos)
 
         safe_margin = 0.3
         req_dist = obs_r + safe_margin
-        
-        # b_obs_all: (H,)
         b_obs_all = -(req_dist - dist_vals)
 
-        # 4. 입력 제한 제약조건 (기존과 동일)
+        # ---------------------------------------------------------
+        # 4. Input Constraint (기존 로직)
+        # ---------------------------------------------------------
         coeffs_flat = coeffs_noisy.reshape(-1)
         dim_var = self.N_cp * 2
+        
         u_min_tiled = jnp.tile(self.u_min, self.N_cp)
         u_max_tiled = jnp.tile(self.u_max, self.N_cp)
+        
         upper_bound = u_max_tiled - coeffs_flat
         lower_bound = u_min_tiled - coeffs_flat
         neg_lower_bound = -lower_bound
 
-        # 5. 제약조건 스택 (Stacking)
-        # G: (H + 2*N_var, N_var) -> 장애물 H개 + 상한 + 하한
+        # ---------------------------------------------------------
+        # 5. 제약조건 병합 (Stacking)
+        # OSQP format: G x <= h
+        # ---------------------------------------------------------
+        
+        # (1) Obstacle: A_obs x <= b_obs
+        # (2) Terminal Upper: A_term x <= u_term
+        # (3) Terminal Lower: A_term x >= l_term  =>  -A_term x <= -l_term
+        # (4) Input Max: I x <= upper
+        # (5) Input Min: I x >= lower => -I x <= -lower
+        
         G = jnp.vstack([
-            A_obs_all,             # (H, N_var)
-            jnp.eye(dim_var),      # (N_var, N_var)
-            -jnp.eye(dim_var)      # (N_var, N_var)
+            A_obs_all,             # Obstacle
+            A_term,                # Terminal (Upper bound)
+            -A_term,               # Terminal (Lower bound)
+            jnp.eye(dim_var),      # Input Max
+            -jnp.eye(dim_var)      # Input Min
         ])
 
         h = jnp.concatenate([
-            b_obs_all,             # (H,)
-            upper_bound,           # (N_var,)
-            neg_lower_bound        # (N_var,)
+            b_obs_all,             # Obstacle
+            u_term,                # Terminal (Upper bound)
+            -l_term,               # Terminal (Lower bound)
+            upper_bound,           # Input Max
+            neg_lower_bound        # Input Min
         ])
 
+        # ---------------------------------------------------------
         # 6. QP 풀기
+        # ---------------------------------------------------------
         P = jnp.eye(dim_var)
         q = jnp.zeros(dim_var)
         
         init_params = solver_init_state if solver_init_state is not None else None
         
-        sol = self.qp.run(init_params=init_params, params_obj=(P, q), params_ineq=(G, h))
+        # params_ineq 만 사용 (등식 제약을 부등식 2개로 변환했으므로)
+        sol = self.qp.run(
+            init_params=init_params, 
+            params_obj=(P, q), 
+            params_ineq=(G, h)
+        )
 
         delta = sol.params.primal.reshape(self.N_cp, 2)
         safe_coeffs = coeffs_noisy + delta
         
-        # [최적화 유지] Cost 함수에서 재사용하기 위해 궤적 리턴
+        # Cost 계산용 궤적 반환
         safe_traj = self.rollout_fn(safe_coeffs, z0)
         
         return safe_coeffs, safe_traj, sol.params
@@ -253,14 +293,17 @@ def run():
     
     key = jax.random.PRNGKey(0)
     traj_hist = [z_curr[:2]]
-    
+
+    log_solver_time = [] # ms
+        
     print("Simulation Running ...")
     
     plt.figure(figsize=(10, 6))
     
     for t in range(500):
         key, subkey = jax.random.split(key)
-        
+
+        jax.block_until_ready(mean_coeffs)
         t0 = time.time()
 
         # MPPI Step with Warm Start passing
@@ -270,7 +313,10 @@ def run():
         
         # Block valid for timing accurate measurements
         jax.block_until_ready(mean_coeffs)
-        dt_step = time.time() - t0
+        t_end = time.time()
+
+        solver_ms = (t_end - t0) * 1000.0
+        log_solver_time.append(solver_ms)
 
         # Execute Control (First step of spline)
         u_seq = bspline_gen.get_sequence(mean_coeffs)
@@ -281,8 +327,6 @@ def run():
         # Physics Update
         z_curr = koopman_step(z_curr, u_curr, DT)
         traj_hist.append(z_curr[:2])
-        
-        print(f"Step {t:02d} | Dist: {dist_to_goal:.2f} | FPS: {1.0/dt_step:.1f}")
 
         # --- Visualization ---
         if t % 1 == 0:
@@ -317,7 +361,7 @@ def run():
             vel_v = z_curr[4]
             vel_w = z_curr[5]
             plt.title(f"Step {t} | Dist: {dist_to_goal:.2f}m | Vel: {vel_v:.2f} m/s")
-            plt.axis('equal')
+            plt.gca().set_aspect('equal', adjustable='box')
             plt.xlim(-5, 10)
             plt.ylim(-4, 4)
             plt.grid(True)
@@ -329,6 +373,23 @@ def run():
             break
             
     plt.show()
+
+    plt.figure()
+    plt.plot(log_solver_time, label='Solver Time (ms)')
+    plt.title(f"OSQP solver time per step")
+    plt.xlabel("Simulation Step")
+    plt.ylabel("Time (ms)")
+    plt.legend()
+    plt.show()
+    # --- Final Stats Print ---
+    print("\n" + "="*30)
+    print(" [Simulation Result Summary]")
+    print("="*30)
+    print(f"Avg Solver Time: {np.mean(log_solver_time[3:]):.2f} ms")
+    print(f"Max Solver Time: {np.max(log_solver_time[3:]):.2f} ms")
+    print(f"Min Solver Time: {np.min(log_solver_time[3:]):.2f} ms")
+    print(f"center solver time: {np.median(log_solver_time[3:]):.2f} ms")
+    print("="*30)
 
 if __name__ == "__main__":
     run()

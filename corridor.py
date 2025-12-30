@@ -6,6 +6,17 @@ from functools import partial
 import numpy as np
 from Bspline import BSplineBasis
 from optimize import BatchedADMM
+import os
+import shutil   
+import io
+import imageio.v2 as imageio
+
+def compute_free_energy(costs, lambda_):
+    min_cost = jnp.min(costs)
+    # Log-Sum-Exp Trick으로 안정적인 계산
+    # F = min_cost - lambda * log( mean( exp( -(c - min)/lambda ) ) )
+    weights_unnorm = jnp.exp(-(costs - min_cost) / lambda_)
+    return min_cost - lambda_ * jnp.log(jnp.mean(weights_unnorm))
 
 # =========================================================
 # 1. System Dynamics (가속도 제어)
@@ -65,9 +76,9 @@ class KoopmanQPProjector:
         # Smooth한 전환을 위해 sigmoid 대신 simple where 사용 (ADMM은 강건하므로 괜찮음)
         is_in_gap = (x_pos >= 3.0) & (x_pos <= 9.0)
         
-        # Gap Width: 0.8m (Half: 0.4)
+        # Gap Width: 0.4m (Half: 0.2)
         # Room Width: 6.0m (Half: 3.0)
-        bound = jnp.where(is_in_gap, 0.4, 3.0)
+        bound = jnp.where(is_in_gap, 0.2, 3.0)
         return bound
 
     @partial(jax.jit, static_argnums=(0,))
@@ -180,7 +191,7 @@ class KoopmanMPPI:
         # 2. Cost Evaluation
         cost_fn = jax.vmap(self.compute_cost, in_axes=(0, None, None))
         costs = cost_fn(safe_samples, z0, target_pos)
-        
+
         # 3. Weight Update
         min_cost = jnp.min(costs)
         weights = jax.nn.softmax(-(costs - min_cost) / self.lambda_)
@@ -194,13 +205,13 @@ class KoopmanMPPI:
         best_idx = jnp.argmin(costs)
         next_solver_state = jax.tree.map(lambda x: x[best_idx], solver_states)
         
-        return final_mean, safe_samples, weights, next_solver_state
+        return final_mean, safe_samples, weights, costs, next_solver_state
 
 # =========================================================
 # 4. Simulation: Narrow Corridor
 # =========================================================
 
-def run():
+def run(save_gif=True, gif_filename="our_result.gif"):
     DT = 0.1
     HORIZON = 30
     N_CP = 10
@@ -221,18 +232,25 @@ def run():
     key = jax.random.PRNGKey(0)
     traj_hist = [z_curr[:2]]
     
+    frames = []
+    energy_history = []
+
+
     print("Simulation Running...")
     
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 5))
     
     for t in range(300):
         key, subkey = jax.random.split(key)
         
         # Step
-        mean_coeffs, safe_samples, weights, solver_state = mppi.step(
+        mean_coeffs, safe_samples, weights, costs, solver_state = mppi.step(
             subkey, mean_coeffs, z_curr, target_pos, solver_state
         )
         
+        free_energy = compute_free_energy(costs, mppi.lambda_)
+        energy_history.append(free_energy)
+
         # Control
         u_seq = bspline_gen.get_sequence(mean_coeffs)
         u_curr = u_seq[0]
@@ -250,12 +268,12 @@ def run():
             ax = plt.gca()
             
             # Draw Obstacles
-            ax.add_patch(Rectangle((3, 0.6), 6, 2.4, color='k', alpha=0.6, label='Obstacle'))
-            ax.add_patch(Rectangle((3, -3.0), 6, 2.4, color='k', alpha=0.6))
+            ax.add_patch(Rectangle((3, 0.2), 6, 2.8, color='k', alpha=0.6, label='Obstacle'))
+            ax.add_patch(Rectangle((3, -3.0), 6, 2.8, color='k', alpha=0.6))
             
             # Draw Safe Bounds (Dotted Line)
-            plt.plot([0, 3, 3, 9, 9, 12], [3, 3, 0.4, 0.4, 3, 3], 'k--', alpha=0.3)
-            plt.plot([0, 3, 3, 9, 9, 12], [-3, -3, -0.4, -0.4, -3, -3], 'k--', alpha=0.3)
+            plt.plot([0, 3, 3, 9, 9, 12], [3, 3, 0.2, 0.2, 3, 3], 'k--', alpha=0.3)
+            plt.plot([0, 3, 3, 9, 9, 12], [-3, -3, -0.2, -0.2, -3, -3], 'k--', alpha=0.3)
             
             # Samples (Top 20)
             rollout_viz = jax.jit(jax.vmap(mppi.projector.rollout_fn, in_axes=(0, None)))
@@ -282,13 +300,29 @@ def run():
             plt.xlim(-1, 12)
             plt.ylim(-3.5, 3.5)
             plt.legend(loc='upper right')
-            plt.pause(0.01)
+
+            if save_gif:
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', dpi=180)
+                buf.seek(0)
+                frames.append(imageio.imread(buf))
+                buf.close()
+            else:
+                plt.pause(0.01)
 
         if dist_to_goal < 0.1:
             print("Goal Reached!")
             break
 
-    plt.show()
+    # --- Loop 종료 후 GIF 생성 ---
+    if save_gif and len(frames) > 0:
+        imageio.mimsave(gif_filename, frames, fps=8, loop=0)
+        print("Done!")
+    else: 
+        plt.show()
+    avg_energy = np.mean(energy_history)
+    std_energy = np.std(energy_history)
+    print(f"\n[Result] Averge Energy : {avg_energy:.2f}, Std Energy : {std_energy:.2f}")
 
 if __name__ == "__main__":
-    run()
+    run(save_gif=True, gif_filename="our_result.gif")
