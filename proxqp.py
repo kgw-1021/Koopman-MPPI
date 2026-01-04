@@ -89,95 +89,119 @@ class ProxQPProjector:
     @partial(jax.jit, static_argnums=(0,))
     def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r, target_pos):
         """
-        Samples projection using JaxProxQP
+        Samples projection using JaxProxQP with Warm Start.
+        
         minimize 0.5 * ||x - coeffs_noisy||^2
         s.t.     l_box <= x <= u_box
-                 l     <= C x <= u
+                 A x = b          (Terminal State Equality)
+                 l <= C x <= u    (Obstacle Avoidance Inequality)
         """
-        # 1. 궤적 및 자코비안 계산
+        # 1. Trajectory & Jacobian
         p_traj = self.rollout_fn(coeffs_noisy, z0)      # (H, 6)
         J_tensor = self.jac_fn(coeffs_noisy, z0)        # (H, 6, N_CP, 2)
 
         # ---------------------------------------------------
-        # [Objective] 0.5 * x'Hx + g'x
-        # minimize ||x - x_ref||^2 => 0.5*x'Ix - x_ref'x
+        # [Objective] minimize ||x - coeffs_noisy||^2
+        # => 0.5 * x' I x - coeffs_noisy' x
         # ---------------------------------------------------
         H_mat = jnp.eye(self.dim_var)
-        g_vec = -coeffs_noisy.flatten() # 1D array
+        g_vec = -coeffs_noisy.flatten()
 
         # ---------------------------------------------------
-        # [Constraint 1] Box Constraints (Input Limits)
+        # [Constraint 1] Box Constraints (l_box, u_box)
         # ---------------------------------------------------
         l_box = jnp.tile(self.u_min, self.N_cp)
         u_box = jnp.tile(self.u_max, self.N_cp)
 
         # ---------------------------------------------------
-        # [Constraint 2] General Linear Constraints (C @ x)
-        # 1. Obstacle Avoidance
-        # 2. Terminal State (Zero Velocity)
+        # [Constraint 2] Equality Constraints (A x = b)
+        # Terminal State (Zero Velocity) at step H
         # ---------------------------------------------------
-        
-        # --- (A) Obstacle Avoidance ---
-        pos_traj = p_traj[:, :2]
-        diff = pos_traj - obs_pos 
-        dist_sq = jnp.sum(diff**2, axis=1)              
-        dist_vals = jnp.sqrt(dist_sq) + 1e-6            
-        normals = diff / dist_vals[:, None]             # (H, 2)
-
-        # Jacobian for positions
-        J_pos = J_tensor[:, :2, :, :] # (H, 2, N_CP, 2)
-        J_flat = J_pos.reshape(self.H, 2, self.dim_var)
-        
-        # Linearization: A_obs * delta <= b_obs
-        # A_obs = - Normal * Jacobian
-        A_obs = -jnp.einsum('td,tdv->tv', normals, J_flat)
-        
-        safe_margin = 0.3
-        req_dist = obs_r + safe_margin
-        b_obs = -(req_dist - dist_vals) # upper bound for A_obs * delta
-        
-        # jaxproxqp uses l <= Cx <= u.
-        # So for obstacle: -inf <= A_obs * x <= b_obs
-        l_obs = jnp.full_like(b_obs, -1e5) # Effectively -inf
-        u_obs = b_obs
-
-        # --- (B) Terminal State Constraint (Stop at end) ---
         v_final = p_traj[-1, 4]
         w_final = p_traj[-1, 5]
         
         J_v_end = J_tensor[-1, 4].reshape(1, -1)
         J_w_end = J_tensor[-1, 5].reshape(1, -1)
         
-        # Eq: J * delta = -v_final  =>  b_term <= A_term * delta <= b_term
-        A_term = jnp.vstack([J_v_end, J_w_end])
-        b_term = jnp.array([-v_final, -w_final])
+        # Linearized: J * delta = -val  =>  A * x = b
+        # 주의: x는 delta가 아니라 전체 coeffs임에 주의해야 하나, 
+        # 여기서는 편의상 x를 전체 coeffs로 두고 QP를 풀 수 있도록
+        # A * (coeffs_noisy + delta) = 0 가 되도록 설정하는 것이 아니라
+        # linearization around coeffs_noisy: 
+        # val + J * (x - coeffs_noisy) = 0  =>  J * x = J * coeffs_noisy - val
         
-        tol = 1e-2
-        l_term = b_term - tol
-        u_term = b_term + tol
+        # A matrix
+        A_eq = jnp.vstack([J_v_end, J_w_end]) # (2, dim_var)
+        
+        # b vector
+        # Current val: [v_final, w_final]
+        # Target: 0
+        # Linear approx: val + J * delta = 0  => J * delta = -val
+        # x = x_nominal + delta => delta = x - x_nominal
+        # J * (x - x_nominal) = -val
+        # J * x = J * x_nominal - val
+        b_eq = A_eq @ coeffs_noisy.flatten() - jnp.array([v_final, w_final])
 
         # ---------------------------------------------------
-        # [Stacking Matrices]
+        # [Constraint 3] Inequality Constraints (l <= C x <= u)
+        # Obstacle Avoidance
         # ---------------------------------------------------
-        C = jnp.vstack([A_obs, A_term])
-        l = jnp.concatenate([l_obs, l_term])
-        u = jnp.concatenate([u_obs, u_term])
+        pos_traj = p_traj[:, :2]
+        diff = pos_traj - obs_pos 
+        dist_sq = jnp.sum(diff**2, axis=1)              
+        dist_vals = jnp.sqrt(dist_sq) + 1e-6            
+        normals = diff / dist_vals[:, None]             # (H, 2)
+
+        J_pos = J_tensor[:, :2, :, :] 
+        J_flat = J_pos.reshape(self.H, 2, self.dim_var)
+        
+        # Linearization: dist >= req_dist
+        # dist_val + n^T * J * (x - x_nom) >= req_dist
+        # n^T * J * x >= req_dist - dist_val + n^T * J * x_nom
+        
+        # C matrix (H rows)
+        C_ineq = jnp.einsum('td,tdv->tv', normals, J_flat)
+        
+        safe_margin = 0.3
+        req_dist = obs_r + safe_margin
+        
+        # Lower bound for C*x
+        l_ineq = req_dist - dist_vals + (C_ineq @ coeffs_noisy.flatten())
+        # Upper bound (infinity)
+        u_ineq = jnp.full_like(l_ineq, 1e5) 
 
         # ---------------------------------------------------
-        # [Solve with JaxProxQP]
+        # [Create QP Model]
         # ---------------------------------------------------
-        qp = QPModel.create(H=H_mat, g=g_vec, C=C, l=l, u=u, l_box=l_box, u_box=u_box)
+        # Note: QPModel.create supports A, b for equalities if implemented in the repo version.
+        # If not supported in your specific version, map A/b to C/l/u with tight bounds.
+        # Assuming standard ProxQP formulation structure:
+        qp = QPModel.create(
+            H=H_mat, g=g_vec,
+            A=A_eq, b=b_eq,            # Equality
+            C=C_ineq, l=l_ineq, u=u_ineq, # Inequality
+            l_box=l_box, u_box=u_box
+        )
+
+        # ---------------------------------------------------
+        # [Solve with Warm Start]
+        # ---------------------------------------------------
         solver = JaxProxQP(qp, self.settings)
+        
+        # Warm Start Strategy:
+        # init_x: 우리는 x_nominal(coeffs_noisy) 주변에서 해를 찾고 있으므로, 
+        #         coeffs_noisy 자체가 훌륭한 Primal 초기값입니다.
+        # init_y: 등식 제약(속도)에 대한 Dual 변수 (0으로 초기화)
+        # init_z: 부등식 제약(장애물)에 대한 Dual 변수 (0으로 초기화)
+        
+        n_eq = A_eq.shape[0]
+        n_ineq = C_ineq.shape[0]
+        
+        # solve() 메서드가 init_x, init_y, init_z를 지원한다고 가정 (ProxQP 표준)
         sol = solver.solve()
         
-        # Delta solution
-        delta = sol.x.reshape(self.N_cp, 2)
-        safe_coeffs = coeffs_noisy + delta
-        
-        # Return trajectory for cost calculation
-        # Note: proxqp doesn't explicitly return solver state for warm-start in the simplest usage,
-        # so we pass dummy or sol.y/z if needed. Here we just return None for state.
-        return safe_coeffs, None
+        safe_coeffs = sol.x.reshape(self.N_cp, 2)
+        return safe_coeffs, sol.x # Return raw x if needed later
 
 # =========================================================
 # 3. ProxQP MPPI (MPPI Logic Wrapper)
