@@ -88,7 +88,7 @@ def get_linear_model(dt):
     return A, B
 
 # =========================================================
-# 3. Dense QP Projector (With Margin Logic)
+# 3. Dense QP Projector 
 # =========================================================
 class KoopmanWallProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):

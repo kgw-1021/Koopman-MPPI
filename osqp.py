@@ -15,7 +15,7 @@ def lift_state(state_std):
     return jnp.array([x, y, jnp.cos(theta), jnp.sin(theta), v, w])
 
 @jax.jit
-def koopman_step(state, control, dt):
+def step_(state, control, dt):
     # state: [x, y, c, s, v, w]
     # control: [accel_v, accel_w] (가속도 제어)
     x, y, c, s, v, w = state
@@ -43,7 +43,7 @@ def koopman_step(state, control, dt):
 # 2. QP Projector with Limits & Warm Start (Fixed)
 # =========================================================
 
-class KoopmanQPProjector:
+class QPProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
@@ -61,7 +61,7 @@ class KoopmanQPProjector:
         # (기존과 동일)
         u_seq = self.bspline.get_sequence(coeffs)
         def step_fn(carry, u):
-            z_next = koopman_step(carry, u, self.dt)
+            z_next = step_(carry, u, self.dt)
             return z_next, z_next[:2]
         _, pos_traj = jax.lax.scan(step_fn, z0, u_seq)
         return pos_traj
@@ -182,17 +182,17 @@ class KoopmanQPProjector:
         return safe_coeffs, safe_traj, sol.params
 
 # =========================================================
-# 3. Koopman MPPI (Updated Costs & Logic)
+# 3. Projected MPPI  (Updated Costs & Logic)
 # =========================================================
 
-class KoopmanMPPI:
+class ProjectedMPPI:
     def __init__(self, horizon, n_cp, dt, n_samples, temperature, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
         self.dt = dt
         self.K = n_samples
         self.lambda_ = temperature
-        self.projector = KoopmanQPProjector(horizon, n_cp, dt, bspline_gen)
+        self.projector = QPProjector(horizon, n_cp, dt, bspline_gen)
 
     @partial(jax.jit, static_argnums=(0,))
     def compute_cost(self, coeffs, z0, target_pos, obs_pos, obs_r):
@@ -221,7 +221,7 @@ class KoopmanMPPI:
             30.0 * term_err + 
             1.0 * stage_err + 
             10.0 * obs_cost + 
-            5 * smoothness_cost +
+            5.0 * smoothness_cost +
             0.1 * energy_cost +       # 움직임 최소화 (작게)
             30.0 * terminal_vel_cost  # 마지막에 멈추기 (크게!)
         )
@@ -274,7 +274,7 @@ def run():
     TEMP = 0.5
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)
-    mppi = KoopmanMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
+    mppi = ProjectedMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
     
    # [초기 상태] x, y, theta, v, w (5차원)
     start_pose = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0])
@@ -325,7 +325,7 @@ def run():
         dist_to_goal = jnp.linalg.norm(z_curr[:2] - target_pos)
 
         # Physics Update
-        z_curr = koopman_step(z_curr, u_curr, DT)
+        z_curr = step_(z_curr, u_curr, DT)
         traj_hist.append(z_curr[:2])
 
         # --- Visualization ---
@@ -375,7 +375,7 @@ def run():
     plt.show()
 
     plt.figure()
-    plt.plot(log_solver_time, label='Solver Time (ms)')
+    plt.plot(log_solver_time[3:], label='Solver Time (ms)')
     plt.title(f"OSQP solver time per step")
     plt.xlabel("Simulation Step")
     plt.ylabel("Time (ms)")
@@ -383,7 +383,7 @@ def run():
     plt.show()
     # --- Final Stats Print ---
     print("\n" + "="*30)
-    print(" [Simulation Result Summary]")
+    print(" [Simulation Result Summary (OSQP)]")
     print("="*30)
     print(f"Avg Solver Time: {np.mean(log_solver_time[3:]):.2f} ms")
     print(f"Max Solver Time: {np.max(log_solver_time[3:]):.2f} ms")

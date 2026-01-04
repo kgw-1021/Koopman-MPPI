@@ -99,9 +99,9 @@ def get_linear_model(dt):
     return A, B
 
 # =========================================================
-# 3. Dense QP Projector (With FIX applied)
+# 3. QP Projector 
 # =========================================================
-class KoopmanDenseProjector:
+class DenseProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
@@ -161,7 +161,6 @@ class KoopmanDenseProjector:
 
     @partial(jax.jit, static_argnums=(0,))
     def project_single_sample(self, coeffs_noisy, z0, obs_pos, obs_r):
-        """ Dense Projection with ADMM Unpacking Fix """
         coeffs_flat = coeffs_noisy.reshape(-1)
         
         # 1. Rollout
@@ -196,24 +195,19 @@ class KoopmanDenseProjector:
         P = jnp.eye(self.N_cp * 4)
         q = jnp.zeros(self.N_cp * 4)
         
-        # [수정됨] ADMM Solve 호출 및 Unpacking
-        # ADMM returns: x_final, (x_final, z_final, y_final)
-        # 우리는 x_final(delta)만 필요합니다.
+        # Solve (Projection)
         delta, _ = self.solver.solve(P, q, A, l, u)
         
         return (coeffs_flat + delta).reshape(self.N_cp, 4)
 
-# =========================================================
-# 4. Koopman MPPI
-# =========================================================
-class KoopmanMPPI:
+class ProjectedMPPI:
     def __init__(self, horizon, n_cp, dt, n_samples, temp):
         self.H = horizon
         self.N_cp = n_cp
         self.K = n_samples
         self.temp = temp
         self.bspline = BSplineBasis(n_cp, horizon)
-        self.projector = KoopmanDenseProjector(horizon, n_cp, dt, self.bspline)
+        self.projector = DenseProjector(horizon, n_cp, dt, self.bspline)
         self.dt = dt
 
     @partial(jax.jit, static_argnums=(0,))
@@ -224,7 +218,6 @@ class KoopmanMPPI:
         samples = mean_coeffs + noise
         
         # 2. Dense Projection (VMAP)
-        # project_single_sample now correctly handles ADMM return tuple
         safe_samples = jax.vmap(self.projector.project_single_sample, in_axes=(0, None, None, None))(
             samples, z_curr, obs_pos, obs_r
         )
@@ -256,6 +249,7 @@ class KoopmanMPPI:
         vel_running = jnp.sum(vel**2) * 0.05
         vel_terminal = jnp.sum(vel[-1]**2) * 30.0
         final_err = jnp.sum((pos[-1] - target)**2) * 50.0
+
         # Obstacle Cost (Soft penalty for MPPI selection)
         obs_dist = jnp.linalg.norm(pos - obs_pos, axis=1)
         obs_pen = jnp.sum(jnp.exp(-2.0*(obs_dist - obs_r))) * 50.0
@@ -318,7 +312,7 @@ def run_simulation(save_gif=True, gif_filename="drone_obstacle.gif"):
     N_CP = 10
     K = 128
     
-    mppi = KoopmanMPPI(H, N_CP, DT, K, 0.8)
+    mppi = ProjectedMPPI  (H, N_CP, DT, K, 0.8)
     
     # Init State: x,y,z=0, vx,vy,vz=0, rpy=0, omega=0
     z_curr = jnp.zeros(12)

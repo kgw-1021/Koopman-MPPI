@@ -28,7 +28,7 @@ def lift_state(state_std):
     return jnp.array([x, y, jnp.cos(theta), jnp.sin(theta), v, w])
 
 @jax.jit
-def koopman_step(state, control, dt):
+def step_(state, control, dt):
     x, y, c, s, v, w = state
     av, aw = control
     next_v = v + av * dt
@@ -45,7 +45,7 @@ def koopman_step(state, control, dt):
 # 2. QP Projector (Dynamic Gap Constraints)
 # =========================================================
 
-class KoopmanQPProjector:
+class QPProjector:
     def __init__(self, horizon, n_cp, dt, bspline_gen):
         self.H = horizon
         self.N_cp = n_cp
@@ -62,7 +62,7 @@ class KoopmanQPProjector:
     def rollout_fn(self, coeffs, z0):
         u_seq = self.bspline.get_sequence(coeffs)
         def step_fn(carry, u):
-            z_next = koopman_step(carry, u, self.dt)
+            z_next = step_(carry, u, self.dt)
             return z_next, z_next
         _, traj = jax.lax.scan(step_fn, z0, u_seq)
         return traj
@@ -147,9 +147,9 @@ class KoopmanQPProjector:
 # 3. MPPI Controller
 # =========================================================
 
-class KoopmanMPPI:
+class ProjectedMPPI:
     def __init__(self, horizon, n_cp, dt, n_samples, temperature, bspline_gen):
-        self.projector = KoopmanQPProjector(horizon, n_cp, dt, bspline_gen)
+        self.projector = QPProjector(horizon, n_cp, dt, bspline_gen)
         self.K = n_samples
         self.lambda_ = temperature
         self.N_cp = n_cp
@@ -219,7 +219,7 @@ def run(save_gif=True, gif_filename="our_result.gif"):
     TEMP = 0.5    
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)
-    mppi = KoopmanMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
+    mppi = ProjectedMPPI(HORIZON, N_CP, DT, N_SAMPLES, TEMP, bspline_gen)
     
     # --- Scenario Setup ---
     start_pose = jnp.array([0.0, 0.0, 0.0, 0.0, 0.0])
@@ -256,7 +256,7 @@ def run(save_gif=True, gif_filename="our_result.gif"):
         u_curr = u_seq[0]
         
         # Dynamics
-        z_curr = koopman_step(z_curr, u_curr, DT)
+        z_curr = step_(z_curr, u_curr, DT)
         traj_hist.append(z_curr[:2])
         
         # Check Goal
