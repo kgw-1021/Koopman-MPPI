@@ -64,8 +64,10 @@ class ProxQPProjector:
         # [Solver Settings]
         # 정확도와 속도 균형을 위한 설정
         self.settings = Settings()
-        self.settings.max_iter = 50
+        self.settings.max_iter = 3
+        self.settings.max_iter_in = 5
         self.settings.eps_abs = 1e-2    
+        self.settings.max_iterative_refine = 1
 
         # [Input Constraints] Box Constraints for jaxproxqp
         self.u_min = jnp.array([-1.0, -2.0]) 
@@ -286,7 +288,7 @@ def run():
     DT = 0.1
     HORIZON = 30
     N_CP = 10
-    N_SAMPLES = 100  
+    N_SAMPLES = 500  
     TEMP = 0.5      
     
     bspline_gen = BSplineBasis(N_CP, HORIZON)
@@ -308,7 +310,7 @@ def run():
     
     log_solver_time = [] # ms
 
-    print("Simulation Running with JaxProxQP...")
+    print("Simulation Running ...")
     
     plt.figure(figsize=(10, 6))
     

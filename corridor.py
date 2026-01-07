@@ -325,4 +325,4 @@ def run(save_gif=True, gif_filename="our_result.gif"):
     print(f"\n[Result] Averge Energy : {avg_energy:.2f}, Std Energy : {std_energy:.2f}")
 
 if __name__ == "__main__":
-    run(save_gif=True, gif_filename="our_result.gif")
+    run(save_gif=False, gif_filename="our_result.gif")

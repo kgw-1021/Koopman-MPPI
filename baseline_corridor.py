@@ -161,7 +161,7 @@ def run(save_gif=True, gif_filename="baseline_result.gif"):
     DT = 0.1
     HORIZON = 40       
     N_CP = 20           
-    N_SAMPLES = 1000    
+    N_SAMPLES = 5000    
     TEMP = 0.5         
     
     U_MIN = jnp.array([-1.5, -2.0])
@@ -258,4 +258,4 @@ def run(save_gif=True, gif_filename="baseline_result.gif"):
     
 
 if __name__ == "__main__":
-    run(save_gif=False, gif_filename="baseline_result.gif")
+    run(save_gif=True, gif_filename="baseline_result.gif")
